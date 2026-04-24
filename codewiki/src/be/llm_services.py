@@ -6,7 +6,11 @@ return slightly non-standard responses (e.g. choices[].index = None).
 
 Supports multiple providers: openai-compatible, anthropic, bedrock, azure-openai.
 """
+from __future__ import annotations
+
 import logging
+from typing import Any
+
 from openai.types import chat
 
 from pydantic_ai.models.openai import OpenAIModel
@@ -84,6 +88,60 @@ class CompatibleOpenAIModel(OpenAIModel):
         return super()._validate_completion(response)
 
 
+def _anthropic_api_model_name(model_name: str) -> str:
+    """Strip LiteLLM-style prefix for the native Anthropic Messages API."""
+    m = model_name.strip()
+    if m.lower().startswith("anthropic/"):
+        return m.split("/", 1)[1]
+    return m
+
+
+def _anthropic_provider_base_url(config: Config) -> str | None:
+    """
+    Base URL for AnthropicProvider; None uses Anthropic's default host.
+
+    Local LiteLLM OpenAI-compatible URLs are not valid for the Anthropic SDK.
+    """
+    raw = (config.llm_base_url or "").strip()
+    if not raw:
+        return None
+    norm = raw.rstrip("/")
+    lowered = norm.lower()
+    if any(
+        hint in lowered
+        for hint in ("0.0.0.0:4000", "127.0.0.1:4000", "localhost:4000")
+    ):
+        logger.warning(
+            "provider=anthropic but llm_base_url looks like a local OpenAI-compatible proxy (%r). "
+            "Using Anthropic's default API host. For LiteLLM, use provider=openai-compatible.",
+            raw,
+        )
+        return None
+    return norm or None
+
+
+def _create_anthropic_model(config: Config, model_name: str) -> Any:
+    """pydantic-ai Anthropic (Messages API), not OpenAI-compatible HTTP."""
+    try:
+        from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            'Native Anthropic requires the anthropic extra. Install with: '
+            'pip install "pydantic-ai[anthropic]"'
+        ) from e
+
+    provider = AnthropicProvider(
+        api_key=config.llm_api_key or None,
+        base_url=_anthropic_provider_base_url(config),
+    )
+    return AnthropicModel(
+        _anthropic_api_model_name(model_name),
+        provider=provider,
+        settings=AnthropicModelSettings(temperature=0.0, max_tokens=config.max_tokens),
+    )
+
+
 def _create_litellm_openai_client(config: Config) -> OpenAI:
     """
     Create an OpenAI-compatible client backed by litellm's proxy.
@@ -106,8 +164,11 @@ def _create_litellm_openai_client(config: Config) -> OpenAI:
     )
 
 
-def create_main_model(config: Config) -> CompatibleOpenAIModel:
+def create_main_model(config: Config) -> Any:
     """Create the main LLM model from configuration."""
+    if (config.provider or "").strip().lower() == "anthropic":
+        return _create_anthropic_model(config, config.main_model)
+
     return CompatibleOpenAIModel(
         model_name=config.main_model,
         provider=OpenAIProvider(
@@ -118,8 +179,11 @@ def create_main_model(config: Config) -> CompatibleOpenAIModel:
     )
 
 
-def create_fallback_model(config: Config) -> CompatibleOpenAIModel:
+def create_fallback_model(config: Config) -> Any:
     """Create the fallback LLM model from configuration."""
+    if (config.provider or "").strip().lower() == "anthropic":
+        return _create_anthropic_model(config, config.fallback_model)
+
     return CompatibleOpenAIModel(
         model_name=config.fallback_model,
         provider=OpenAIProvider(
